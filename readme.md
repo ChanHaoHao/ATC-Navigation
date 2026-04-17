@@ -147,7 +147,7 @@ It can also deal with multiple aircrafts.
 
 ## Future Works
 
-- Maybe deal with left turn and right turn for the last taxiway, so that it does not need to light the full taxiway up
+- ~~Maybe deal with left turn and right turn for the last taxiway, so that it does not need to light the full taxiway up~~ [Solved on Apr 17]
 - Deal with different call signs, sometimes the ATC and pilot respond with abbreviated call signs such as Delta 795 heavy, Delta 795, 795 all means the same aircraft
 - Confirm the response from the pilot is saying the same thing as the ATC command
 - Deal with all recordings, not all are commands, sometimes its asking for the info or ATC commands give suggestions for the pilot to make decision, or pilots fails to follow the instructions and ask for new commands.
