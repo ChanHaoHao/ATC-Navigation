@@ -2,8 +2,6 @@
 
 An interactive airport ground map that parses Air Traffic Control (ATC) transcripts and highlights aircraft taxi routes in real time. Load any airport's GeoJSON, type an ATC instruction, and watch the route resolve itself geometrically on the map.
 
-![ATC Surface Map — dark terminal UI with taxiway route highlighted in orange]
-
 ---
 
 ## Overview
@@ -24,7 +22,9 @@ This tool solves that ambiguity using **geometric intersection validation**: it 
   - 🔴 Red — runway (from landing threshold to exit point)
   - 🟠 Orange — current taxi route
   - 🟡 Yellow — previously cleared route history
+  - 🟣 Purple - Path found by BFS to connect broken paths
   - ⬜ Grey — unrelated segments restored to base appearance
+- **BFS propose taxiway** — Sometimes the ATC doesn't give the fully connected path, and the BFS proposes the shortest taxiway to connect the broken path, limited upto 2 addition taxiway.
 - **Partial segment coloring** — only the traversed portion of each taxiway is highlighted, not the entire taxiway geometry
 - **Interactive SVG map** — pan, zoom, hover tooltips, layer toggles, label display, and a debug mode that shows per-segment coloring with feature indices
 - **GeoJSON upload** — drag-and-drop or click to load any airport's aeroway GeoJSON
@@ -61,9 +61,6 @@ pip install -r requirements.txt
 
 export HF_TOKEN="your-huggingface-token"
 
-# Option A: auto-load GeoJSON on startup
-GEOJSON_PATH=path/to/jfk.geojson python server.py
-
 # Option B: start empty, upload via frontend drag-and-drop
 python server.py
 ```
@@ -85,10 +82,7 @@ The frontend runs at `http://localhost:3000` (or the port Vite assigns).
 ### 3. Use It
 
 1. Drop a `.geojson` file onto the browser window (it auto-uploads to the backend)
-2. Type an ATC instruction in the bottom panel, for example:
-   - `Delta 795 continues, Echo Foxtrot Alpha to the ramp.`
-   - `United 479, taxi to runway one three left via Echo, Kilo`
-   - `JetBlue 112 cleared to land runway 13 left, wind 150 at 9`
+2. Type an ATC instruction in the bottom panel
 3. Press **PARSE** (or Enter) — the route resolves and highlights on the map
 4. Issue follow-up commands for the same callsign — the tool remembers where the aircraft is
 
@@ -116,18 +110,52 @@ Any GeoJSON `FeatureCollection` with `aeroway` properties (`taxiway`, `taxilane`
 
 Given the ATC instruction *"Echo Foxtrot Alpha"*, the backend:
 
+0. Utilize info from `.geojson` to determine which taxiway is available for which runway to exit, and what are the neighbors for each taxiway
 1. **Parses** with Llama 3 70B: extracts `route_raw = ["E", "F", "A"]` (each phonetic letter separately)
 2. **Generates groupings** — all ways to combine the letters into valid taxiway refs at this airport:
    - `["E", "F", "A"]` — three taxiways
    - `["E", "FA"]` — taxiway E + compound FA
    - `["EF", "A"]` — compound EF + taxiway A (only if EF exists in the GeoJSON)
 3. **Checks connectivity** — for each grouping, verifies that consecutive taxiways geometrically intersect using buffered Shapely geometries (~15m tolerance for OSM data gaps)
-4. **Selects the winner** — prefers connected groupings, then biases toward the grouping whose first taxiway touches the known landing runway
-5. **Builds colored segments** — computes entry and exit points on each taxiway using intersection centroids, then slices the original GeoJSON coordinates to color only the traversed portion
+4. If the ATC commands cannot fully connect, use **BFS** to find the shortest path to connect the broken taxiway commands (maximum 2 additional taxiway can be used)
+5. **Selects the winner** — prefers connected groupings, then biases toward the grouping whose first taxiway touches the known landing runway
+6. **Builds colored segments** — computes entry and exit points on each taxiway using intersection centroids, then slices the original GeoJSON coordinates to color only the traversed portion
 
 ---
 
-## API Reference
+## Example
+
+The server parse out the following ATC commands and show the path.
+
+1. Delta 795, heavy Kennedy Tower, hello, number 3 behind company, wind 10020, gust 28, runway 13L, clear to land.
+2. Delta 795 Heavy, exit via Zulu Alpha at Foxtrot, join Alpha, and then monitor 1219.
+3. Delta 795 Heavy continues, Echo Foxtrot Alpha to the ramp.
+
+![ATC_navi_Demo1](./media/ATC_navi_Demo1.gif)
+
+It can also deal with multiple aircrafts.
+
+1. Delta 795, heavy Kennedy Tower, hello, number 3 behind company, wind 10020, gust 28, runway 13L, clear to land.
+2. Tango Lima Heavy Kennedy Tower, hello, number 4 behind the heavy airbus, caution the wake terminal, 7100 at 19, gust 28, runway 13L, cleared to land.
+3. Delta 795 Heavy, exit via Zulu Alpha at Foxtrot, join Alpha, and then monitor 1219.
+4. Tango Lima Heavy, exit to the right at Delta Bravo, then turn left onto Alpha.
+5. Delta 795 Heavy continues, Echo Foxtrot Alpha to the ramp.
+
+![ATC_navi_Demo2](./media/ATC_navi_Demo2.gif)
+
+---
+
+## Future Works
+
+- Maybe deal with left turn and right turn for the last taxiway, so that it does not need to light the full taxiway up
+- Deal with different call signs, sometimes the ATC and pilot respond with abbreviated call signs such as Delta 795 heavy, Delta 795, 795 all means the same aircraft
+- Confirm the response from the pilot is saying the same thing as the ATC command
+- Deal with all recordings, not all are commands, sometimes its asking for the info or ATC commands give suggestions for the pilot to make decision, or pilots fails to follow the instructions and ask for new commands.
+- ULTIMATE GOAL!!! Connect to ATC livestream, but its going to be a huge challenge, because the transcribe is not very precise
+
+---
+
+<!-- ## API Reference
 
 All endpoints accept/return JSON. The backend must have a GeoJSON loaded (via `/load-geojson` or `GEOJSON_PATH`) before route-related endpoints will work.
 
@@ -142,6 +170,10 @@ All endpoints accept/return JSON. The backend must have a GeoJSON loaded (via `/
 | `GET` | `/taxiways` | All taxiway refs and their connected neighbors |
 | `GET` | `/aircraft-state` | Current state for all tracked callsigns |
 | `GET` | `/aircraft-state/{callsign}` | State for a specific callsign |
+| `GET` | `/intersections` | Return all pre-computed taxiway intersections |
+| `GET` | `/taxiways` | Return all taxiway refs and which others they intersects |
+| `GET` | `/runway-entry-taxiways` | Return the directional runway entry index: for each landing direction, which taxiway refs can be directly entered from that runway end based on geometric direction analysis |
+| `GET` | `/taxiway-connections` | Return genuine taxiway-to-taxiway connections, with runway phantom intersections removed |
 | `DELETE` | `/aircraft-state/{callsign}` | Clear state for a callsign (e.g. after pushback) |
 
 ### `/parse` request body
@@ -184,7 +216,7 @@ All endpoints accept/return JSON. The backend must have a GeoJSON loaded (via `/
 | `HF_TOKEN` | *(required)* | HuggingFace API token for Llama 3 70B inference |
 | `GEOJSON_PATH` | *(none)* | Path to a GeoJSON file to load automatically on startup |
 
-The frontend hardcodes `http://localhost:8000` as the backend URL. To change it, update `BACKEND_URL` in `src/App.jsx`.
+The frontend hardcodes `http://localhost:8000` as the backend URL. To change it, update `BACKEND_URL` in `src/App.jsx`. -->
 
 ---
 
