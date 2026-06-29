@@ -1,0 +1,519 @@
+"""
+ATC Navigation Parser Backend
+─────────────────────────────
+Loads airport GeoJSON, parses ATC commands via Llama 3 70B on HuggingFace,
+resolves taxiway routes using geometric intersection checks,
+and serves the resolved paths to the frontend.
+
+Usage:
+    pip install fastapi uvicorn shapely huggingface_hub
+    python server.py
+
+    # or
+    uvicorn server:app --reload --port 8000
+"""
+
+import json
+import os
+from itertools import product
+from pathlib import Path
+from typing import Optional
+
+from huggingface_hub import InferenceClient
+from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from shapely.geometry import shape, LineString, Point, MultiLineString
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  APP SETUP
+# ══════════════════════════════════════════════════════════════════════════════
+
+app = FastAPI(title="ATC Nav Parser", version="0.1.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ── State ─────────────────────────────────────────────────────────────────────
+airport_data = {
+    "geojson": None,
+    "taxiway_geoms": {},      # ref -> Shapely geometry (merged)
+    "taxiway_features": {},   # ref -> list of GeoJSON features
+    "runway_geoms": {},       # ref -> Shapely geometry
+    "valid_refs": set(),      # all valid taxiway ref names
+    "intersections": {},      # (a, b) -> list of intersection points
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  GEOMETRY ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
+
+BUFFER_TOLERANCE = 0.00015  # ~15 meters, accounts for OSM gaps
+
+
+def load_geojson(geojson: dict):
+    """Parse GeoJSON and build taxiway geometry index."""
+    airport_data["geojson"] = geojson
+    airport_data["taxiway_geoms"].clear()
+    airport_data["taxiway_features"].clear()
+    airport_data["runway_geoms"].clear()
+    airport_data["valid_refs"].clear()
+    airport_data["intersections"].clear()
+
+    features = geojson.get("features", [])
+
+    for f in features:
+        props = f.get("properties", {})
+        aeroway = props.get("aeroway")
+        ref = props.get("ref")
+        if not ref:
+            continue
+
+        try:
+            geom = shape(f["geometry"])
+        except Exception:
+            continue
+
+        if aeroway == "taxiway" or aeroway == "taxilane":
+            if ref in airport_data["taxiway_geoms"]:
+                airport_data["taxiway_geoms"][ref] = airport_data["taxiway_geoms"][ref].union(geom)
+            else:
+                airport_data["taxiway_geoms"][ref] = geom
+
+            if ref not in airport_data["taxiway_features"]:
+                airport_data["taxiway_features"][ref] = []
+            airport_data["taxiway_features"][ref].append(f)
+
+            airport_data["valid_refs"].add(ref)
+
+        elif aeroway == "runway":
+            if ref in airport_data["runway_geoms"]:
+                airport_data["runway_geoms"][ref] = airport_data["runway_geoms"][ref].union(geom)
+            else:
+                airport_data["runway_geoms"][ref] = geom
+
+    # Pre-compute intersections between all taxiway pairs
+    refs = sorted(airport_data["valid_refs"])
+    print(f"Loaded {len(refs)} taxiway refs: {refs}")
+    print(f"Loaded {len(airport_data['runway_geoms'])} runway refs: {sorted(airport_data['runway_geoms'].keys())}")
+
+    for i, a in enumerate(refs):
+        for b in refs[i + 1:]:
+            ga = airport_data["taxiway_geoms"][a].buffer(BUFFER_TOLERANCE)
+            gb = airport_data["taxiway_geoms"][b].buffer(BUFFER_TOLERANCE)
+            if ga.intersects(gb):
+                ix = ga.intersection(gb)
+                centroid = ix.centroid
+                airport_data["intersections"][(a, b)] = {
+                    "point": [centroid.x, centroid.y],
+                }
+                airport_data["intersections"][(b, a)] = {
+                    "point": [centroid.x, centroid.y],
+                }
+
+    print(f"Found {len(airport_data['intersections']) // 2} taxiway intersection pairs")
+
+
+def taxiways_intersect(a: str, b: str) -> bool:
+    """Check if two taxiways intersect."""
+    return (a, b) in airport_data["intersections"]
+
+
+def get_intersection_point(a: str, b: str) -> Optional[list]:
+    """Get the intersection point of two taxiways."""
+    ix = airport_data["intersections"].get((a, b))
+    return ix["point"] if ix else None
+
+
+def get_taxiway_segment_near(ref: str, point: list) -> Optional[list]:
+    """Get the nearest point on a taxiway to a given point."""
+    geom = airport_data["taxiway_geoms"].get(ref)
+    if not geom:
+        return None
+    p = Point(point[0], point[1])
+    nearest = geom.interpolate(geom.project(p))
+    return [nearest.x, nearest.y]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ROUTE RESOLVER — disambiguation via geometry
+# ══════════════════════════════════════════════════════════════════════════════
+
+# NATO phonetic alphabet mapping
+PHONETIC = {
+    "alpha": "A", "bravo": "B", "charlie": "C", "delta": "D",
+    "echo": "E", "foxtrot": "F", "golf": "G", "hotel": "H",
+    "india": "I", "juliet": "J", "kilo": "K", "lima": "L",
+    "mike": "M", "november": "N", "oscar": "O", "papa": "P",
+    "quebec": "Q", "romeo": "R", "sierra": "S", "tango": "T",
+    "uniform": "U", "victor": "V", "whiskey": "W", "xray": "X",
+    "yankee": "Y", "zulu": "Z",
+}
+
+
+def phonetic_to_letters(names: list[str]) -> list[str]:
+    """Convert phonetic names to letters. E.g. ['Echo', 'Foxtrot'] -> ['E', 'F']"""
+    result = []
+    for name in names:
+        letter = PHONETIC.get(name.lower(), name.upper())
+        result.append(letter)
+    return result
+
+
+def generate_groupings(letters: list[str], valid_refs: set) -> list[list[str]]:
+    """
+    Generate all possible groupings of letters into valid taxiway refs.
+
+    E.g. ['E', 'F', 'A'] with valid_refs {'E', 'F', 'A', 'FA', 'EF'}
+    -> [['E', 'F', 'A'], ['E', 'FA'], ['EF', 'A']]
+    """
+    if not letters:
+        return [[]]
+
+    results = []
+    for end in range(1, len(letters) + 1):
+        combined = "".join(letters[:end])
+        if combined in valid_refs:
+            for rest in generate_groupings(letters[end:], valid_refs):
+                results.append([combined] + rest)
+    return results
+
+
+def check_route_connectivity(route: list[str]) -> tuple[bool, list]:
+    """
+    Check if a route has valid intersections between all consecutive pairs.
+    Returns (is_valid, intersection_points).
+    """
+    if len(route) < 2:
+        return True, []
+
+    points = []
+    for i in range(len(route) - 1):
+        a, b = route[i], route[i + 1]
+        if not taxiways_intersect(a, b):
+            return False, []
+        pt = get_intersection_point(a, b)
+        if pt:
+            points.append({"from": a, "to": b, "point": pt})
+    return True, points
+
+
+def resolve_route(raw_names: list[str]) -> dict:
+    """
+    Given raw taxiway names from ATC transcript, resolve to actual route
+    using geometric intersection validation.
+    """
+    valid_refs = airport_data["valid_refs"]
+
+    # Convert phonetic to letters
+    letters = phonetic_to_letters(raw_names)
+
+    # Generate all possible groupings
+    groupings = generate_groupings(letters, valid_refs)
+
+    if not groupings:
+        return {
+            "resolved_route": letters,
+            "method": "fallback_no_valid_grouping",
+            "intersections": [],
+            "path_coordinates": [],
+            "all_candidates": [],
+        }
+
+    # Check each grouping for connectivity
+    candidates = []
+    for g in groupings:
+        valid, points = check_route_connectivity(g)
+        candidates.append({
+            "route": g,
+            "valid": valid,
+            "intersections": points,
+        })
+
+    # Pick the first valid one (prefer longer routes for specificity)
+    valid_candidates = [c for c in candidates if c["valid"]]
+
+    if valid_candidates:
+        # Prefer the candidate with the most segments (most specific path)
+        best = max(valid_candidates, key=lambda c: len(c["route"]))
+    else:
+        # No valid intersections found, use the simplest grouping
+        best = candidates[0] if candidates else {"route": letters, "intersections": []}
+
+    # Build the full path with coordinates
+    path_coords = build_path_coordinates(best["route"], best.get("intersections", []))
+
+    return {
+        "resolved_route": best["route"],
+        "method": "intersection_validated" if best.get("valid") else "fallback",
+        "intersections": best.get("intersections", []),
+        "path_coordinates": path_coords,
+        "all_candidates": [
+            {"route": c["route"], "valid": c["valid"]} for c in candidates
+        ],
+    }
+
+
+def build_path_coordinates(route: list[str], intersections: list[dict]) -> list[dict]:
+    """
+    Build an ordered list of coordinates along the resolved route.
+    Uses intersection points to find the relevant segments of each taxiway.
+    """
+    if not route or not intersections:
+        # Return centroids of each taxiway as fallback
+        coords = []
+        for ref in route:
+            geom = airport_data["taxiway_geoms"].get(ref)
+            if geom:
+                c = geom.centroid
+                coords.append({"ref": ref, "lng": c.x, "lat": c.y, "type": "centroid"})
+        return coords
+
+    coords = []
+
+    for i, ix in enumerate(intersections):
+        # Add the intersection point
+        coords.append({
+            "ref": f"{ix['from']}∩{ix['to']}",
+            "lng": ix["point"][0],
+            "lat": ix["point"][1],
+            "type": "intersection",
+            "from_taxiway": ix["from"],
+            "to_taxiway": ix["to"],
+        })
+
+    return coords
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  LLAMA 3 70B (HuggingFace) — Parse ATC transcript
+# ══════════════════════════════════════════════════════════════════════════════
+
+def parse_atc_with_llm(transcript: str) -> dict:
+    """Send transcript to Llama 3 70B on HuggingFace for structured parsing."""
+    hf_token = os.environ.get("HF_TOKEN", "")
+    if not hf_token:
+        raise HTTPException(status_code=500, detail="HF_TOKEN not set. Export your HuggingFace token.")
+
+    valid_refs = sorted(airport_data["valid_refs"])
+    runway_refs = sorted(airport_data["runway_geoms"].keys())
+
+    client = InferenceClient(
+        model="meta-llama/Llama-3-70b-chat-hf",
+        token=hf_token,
+    )
+
+    system_prompt = f"""You are an ATC communication parser for airport ground operations.
+Parse the ATC instruction into structured JSON. Return ONLY valid JSON with no markdown, no explanation, no backticks.
+
+Valid taxiway names at this airport: {', '.join(valid_refs)}
+Valid runway designators: {', '.join(runway_refs)}
+
+CRITICAL RULES:
+1. When phonetic letters are spoken in sequence (e.g. "Zulu Alpha"), output each 
+   letter separately: ["Z", "A"]. Do NOT try to combine them yourself.
+   The backend will check geometric intersections to determine if "ZA" is a 
+   compound taxiway name or two separate taxiways.
+2. "Monitor 1219" means frequency 121.9 MHz
+3. "Company" means another aircraft of the same airline
+4. Extract the route as individual phonetic-to-letter conversions
+
+Return this exact JSON structure:
+{{
+  "callsign": "airline and flight number",
+  "controller": "tower|ground|clearance|approach",
+  "instruction_type": "landing_clearance|taxi_route|taxi_continue|hold|frequency_change",
+  "route_raw": ["each phonetic name as a separate letter, e.g. E, F, A"],
+  "runway": "runway designator if mentioned, or null",
+  "hold_short": "what to hold short of, or null",
+  "cross_runway": "runway to cross, or null",
+  "frequency_change": "frequency if mentioned, or null",
+  "destination": "ramp|gate number|terminal|null",
+  "wind": {{"direction": number, "speed": number, "gust": number}} or null,
+  "sequence": "sequence number if mentioned, or null",
+  "summary": "plain English summary of the full instruction"
+}}"""
+
+    response = client.chat_completion(
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Parse this ATC instruction:\n\n{transcript}"},
+        ],
+        max_tokens=1024,
+        temperature=0.1,
+    )
+
+    text = response.choices[0].message.content
+    text = text.strip().removeprefix("```json").removesuffix("```").strip()
+    return json.loads(text)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  API ENDPOINTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ParseRequest(BaseModel):
+    transcript: str
+
+
+class ParseResponse(BaseModel):
+    parsed: dict
+    route: dict
+    taxiway_refs: list[str]
+    runway_refs: list[str]
+
+
+@app.get("/")
+def root():
+    return {
+        "service": "ATC Nav Parser",
+        "status": "ok",
+        "airport_loaded": airport_data["geojson"] is not None,
+        "taxiway_count": len(airport_data["valid_refs"]),
+    }
+
+
+@app.post("/load-geojson")
+async def upload_geojson(file: UploadFile = File(...)):
+    """Upload and load airport GeoJSON data."""
+    content = await file.read()
+    try:
+        geojson = json.loads(content)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    if geojson.get("type") != "FeatureCollection":
+        raise HTTPException(status_code=400, detail="Must be a GeoJSON FeatureCollection")
+
+    load_geojson(geojson)
+
+    return {
+        "status": "loaded",
+        "filename": file.filename,
+        "features": len(geojson.get("features", [])),
+        "taxiway_refs": sorted(airport_data["valid_refs"]),
+        "runway_refs": sorted(airport_data["runway_geoms"].keys()),
+        "intersection_pairs": len(airport_data["intersections"]) // 2,
+    }
+
+
+@app.post("/load-geojson-path")
+async def load_geojson_from_path(path: str):
+    """Load GeoJSON from a local file path."""
+    p = Path(path)
+    if not p.exists():
+        raise HTTPException(status_code=404, detail=f"File not found: {path}")
+
+    with open(p) as f:
+        geojson = json.load(f)
+
+    load_geojson(geojson)
+
+    return {
+        "status": "loaded",
+        "path": str(p),
+        "features": len(geojson.get("features", [])),
+        "taxiway_refs": sorted(airport_data["valid_refs"]),
+        "runway_refs": sorted(airport_data["runway_geoms"].keys()),
+        "intersection_pairs": len(airport_data["intersections"]) // 2,
+    }
+
+
+@app.post("/parse")
+async def parse_transcript(req: ParseRequest):
+    """
+    Full pipeline: parse ATC transcript -> resolve route -> return path.
+    Requires ANTHROPIC_API_KEY env var and GeoJSON to be loaded.
+    """
+    if not airport_data["geojson"]:
+        raise HTTPException(status_code=400, detail="No GeoJSON loaded. POST to /load-geojson first.")
+
+    # Step 1: Parse with Llama 3 70B
+    parsed = parse_atc_with_llm(req.transcript)
+
+    # Step 2: Resolve route using intersection geometry
+    route_raw = parsed.get("route_raw", [])
+    route_result = resolve_route(route_raw) if route_raw else {
+        "resolved_route": [],
+        "method": "no_route",
+        "intersections": [],
+        "path_coordinates": [],
+        "all_candidates": [],
+    }
+
+    return {
+        "parsed": parsed,
+        "route": route_result,
+        "taxiway_refs": sorted(airport_data["valid_refs"]),
+        "runway_refs": sorted(airport_data["runway_geoms"].keys()),
+    }
+
+
+@app.post("/resolve-route")
+async def resolve_route_endpoint(names: list[str]):
+    """
+    Resolve a route without Claude — just pass taxiway letters directly.
+    Useful for testing. E.g. POST ["E", "F", "A"]
+    """
+    if not airport_data["geojson"]:
+        raise HTTPException(status_code=400, detail="No GeoJSON loaded.")
+
+    result = resolve_route(names)
+    return result
+
+
+@app.get("/intersections")
+async def get_intersections():
+    """Return all pre-computed taxiway intersections."""
+    if not airport_data["geojson"]:
+        raise HTTPException(status_code=400, detail="No GeoJSON loaded.")
+
+    pairs = {}
+    for (a, b), data in airport_data["intersections"].items():
+        if a < b:  # avoid duplicates
+            pairs[f"{a}-{b}"] = data["point"]
+
+    return {
+        "count": len(pairs),
+        "intersections": pairs,
+    }
+
+
+@app.get("/taxiways")
+async def get_taxiways():
+    """Return all taxiway refs and which others they intersect."""
+    if not airport_data["geojson"]:
+        raise HTTPException(status_code=400, detail="No GeoJSON loaded.")
+
+    result = {}
+    for ref in sorted(airport_data["valid_refs"]):
+        connects = []
+        for (a, b) in airport_data["intersections"]:
+            if a == ref:
+                connects.append(b)
+        result[ref] = sorted(connects)
+
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    import uvicorn
+
+    # Auto-load GeoJSON if path provided
+    geojson_path = os.environ.get("GEOJSON_PATH")
+    if geojson_path and Path(geojson_path).exists():
+        print(f"Auto-loading GeoJSON from {geojson_path}")
+        with open(geojson_path) as f:
+            load_geojson(json.load(f))
+
+    uvicorn.run(app, host="0.0.0.0", port=8000)
