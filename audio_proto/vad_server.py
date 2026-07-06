@@ -5,9 +5,12 @@
 #     "uvicorn>=0.24.0",
 #     "python-multipart>=0.0.6",
 #     "silero-vad>=5.1",
+#     "faster-whisper>=1.0",
 #     "soundfile>=0.12",
 #     "soxr>=0.3",
 #     "numpy>=1.24.0",
+#     "nvidia-cublas-cu12",
+#     "nvidia-cudnn-cu12>=9,<10",
 # ]
 #
 # [[tool.uv.index]]
@@ -19,17 +22,21 @@
 # torch = { index = "pytorch-cpu" }
 # torchaudio = { index = "pytorch-cpu" }
 # ///
-"""Step-1 audio prototype: upload an mp3, VAD-split it into transmissions,
-listen to each cut. Run with:
+"""Audio prototype, steps 1+2: upload an mp3, VAD-split it into transmissions,
+listen to each cut, and watch per-row transcripts fill in as faster-whisper
+works through the segments in the background. Run with:
 
     uv run audio_proto/vad_server.py
 
 then open http://localhost:8100
 """
 
+import os
 import shutil
 import subprocess
 import tempfile
+import threading
+import uuid
 from pathlib import Path
 
 import numpy as np
@@ -39,6 +46,7 @@ import torch
 import uvicorn
 from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse
+from faster_whisper import WhisperModel
 from silero_vad import get_speech_timestamps, load_silero_vad
 
 # ---- VAD tunables -----------------------------------------------------------
@@ -48,12 +56,29 @@ MIN_SPEECH_S = 0.3    # regions shorter than this are dropped (squelch clicks)
 SPEECH_PAD_S = 0.1    # padding added to each side of a detected region
 # -----------------------------------------------------------------------------
 
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small.en")
+
+# Seeds Whisper's decoder with domain vocabulary (kept under its 224-token cap)
+AVIATION_PROMPT = (
+    "Air traffic control radio at Kennedy airport. Kennedy Ground, Kennedy Tower, "
+    "Delta 795 heavy, runway 31L, runway 22R, exit right at Zulu Alpha, "
+    "taxi via Alpha, Bravo, Charlie, Echo, Foxtrot, Golf, Hotel, India, Juliet, "
+    "Kilo, Lima, Mike, November, Oscar, Papa, Quebec, Romeo, Sierra, Tango, "
+    "Uniform, Victor, Whiskey, X-ray, Yankee, Zulu, hold short of, cleared to land, "
+    "cleared for takeoff, contact ground point niner, readback correct."
+)
+
 TARGET_SR = 16000
 PORT = 8100
 
-app = FastAPI(title="ATC audio prototype — step 1: VAD split")
+app = FastAPI(title="ATC audio prototype — steps 1+2: VAD split + transcription")
 
 _vad_model = None
+_whisper_model = None
+_whisper_lock = threading.Lock()
+
+# job_id -> {status, done, total, error, segments}; in-memory only, fine for a prototype
+JOBS: dict[str, dict] = {}
 
 
 def decode_to_16k_mono(path: str) -> np.ndarray:
@@ -101,6 +126,71 @@ def vad_split(audio: np.ndarray) -> list[dict]:
     return segments
 
 
+def _preload_cuda_libs() -> None:
+    """ctranslate2 dlopens cuBLAS/cuDNN at runtime; the pip-installed copies are
+    not on the loader search path, so load them into the process by full path."""
+    import ctypes
+    import nvidia  # namespace package: iterate __path__, __file__ is None
+
+    for root in nvidia.__path__:
+        for pattern in ("cublas/lib/libcublas*.so.*", "cudnn/lib/libcudnn*.so.*"):
+            for lib in sorted(Path(root).glob(pattern)):
+                try:
+                    ctypes.CDLL(str(lib))
+                except OSError:
+                    pass
+
+
+def get_whisper() -> WhisperModel:
+    global _whisper_model
+    with _whisper_lock:
+        if _whisper_model is None:
+            if shutil.which("nvidia-smi"):
+                try:
+                    _preload_cuda_libs()
+                    model = WhisperModel(WHISPER_MODEL, device="cuda", compute_type="float16")
+                    # cuDNN kernels only load on first inference — fail here, not mid-job
+                    next(model.transcribe(np.zeros(TARGET_SR, dtype=np.float32))[0], None)
+                    _whisper_model = model
+                    print(f"whisper: {WHISPER_MODEL} on cuda (float16)")
+                    return _whisper_model
+                except Exception as e:
+                    print(f"whisper: GPU init failed ({e}); falling back to CPU")
+            _whisper_model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+            print(f"whisper: {WHISPER_MODEL} on cpu (int8)")
+        return _whisper_model
+
+
+def transcribe_job(job_id: str, audio: np.ndarray) -> None:
+    """Worker thread: fill in transcript + words for each segment of a job."""
+    job = JOBS[job_id]
+    try:
+        model = get_whisper()  # may download the model on first run
+        job["status"] = "transcribing"
+        for seg in job["segments"]:
+            chunk = audio[int(seg["start_s"] * TARGET_SR):int(seg["end_s"] * TARGET_SR)]
+            pieces, _ = model.transcribe(
+                chunk,
+                language="en",
+                beam_size=5,
+                word_timestamps=True,
+                initial_prompt=AVIATION_PROMPT,
+                condition_on_previous_text=False,
+            )
+            texts, words = [], []
+            for piece in pieces:
+                texts.append(piece.text.strip())
+                for w in piece.words or []:
+                    words.append({"w": w.word.strip(), "t": round(float(seg["start_s"] + w.start), 2)})
+            seg["transcript"] = " ".join(t for t in texts if t)
+            seg["words"] = words
+            job["done"] += 1
+        job["status"] = "done"
+    except Exception as e:
+        job["status"] = "error"
+        job["error"] = str(e)
+
+
 @app.post("/upload-audio")
 async def upload_audio(file: UploadFile):
     suffix = Path(file.filename or "upload.mp3").suffix or ".mp3"
@@ -113,7 +203,24 @@ async def upload_audio(file: UploadFile):
             raise HTTPException(status_code=400, detail=f"could not decode audio: {e}")
     if audio.size == 0:
         raise HTTPException(status_code=400, detail="decoded audio is empty")
+
+    segments = vad_split(audio)
+    for seg in segments:
+        seg["transcript"] = None  # filled in by the job as it progresses
+        seg["words"] = None
+
+    job_id = uuid.uuid4().hex[:12]
+    JOBS[job_id] = {
+        "status": "loading_model",
+        "done": 0,
+        "total": len(segments),
+        "error": None,
+        "segments": segments,
+    }
+    threading.Thread(target=transcribe_job, args=(job_id, audio), daemon=True).start()
+
     return {
+        "job_id": job_id,
         "duration_s": round(audio.size / TARGET_SR, 2),
         "tunables": {
             "vad_threshold": VAD_THRESHOLD,
@@ -121,7 +228,20 @@ async def upload_audio(file: UploadFile):
             "min_speech_s": MIN_SPEECH_S,
             "speech_pad_s": SPEECH_PAD_S,
         },
-        "segments": vad_split(audio),
+        "segments": segments,
+    }
+
+
+@app.get("/audio-job/{job_id}")
+def audio_job(job_id: str):
+    job = JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="unknown job")
+    return {
+        "status": job["status"],
+        "progress": {"done": job["done"], "total": job["total"]},
+        "error": job["error"],
+        "segments": job["segments"],
     }
 
 
@@ -129,7 +249,7 @@ PAGE = """<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
-<title>ATC audio — VAD split prototype</title>
+<title>ATC audio — VAD + transcription prototype</title>
 <style>
   :root { color-scheme: dark; }
   body { font-family: system-ui, sans-serif; background: #101418; color: #dde3ea;
@@ -141,7 +261,9 @@ PAGE = """<!doctype html>
   table { border-collapse: collapse; width: 100%; }
   th, td { padding: 0.45rem 0.7rem; text-align: left; border-bottom: 1px solid #232a32; }
   th { color: #8b95a1; font-weight: 500; font-size: 0.8rem; text-transform: uppercase; }
-  td.num { font-variant-numeric: tabular-nums; }
+  td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  td.txt { width: 55%; }
+  td.txt.pending { color: #566270; }
   tr.playing { background: #1a2833; }
   button.play { background: #1f6feb; color: white; border: 0; border-radius: 5px;
                 padding: 0.3rem 0.8rem; cursor: pointer; font-size: 0.9rem; }
@@ -151,10 +273,11 @@ PAGE = """<!doctype html>
 </style>
 </head>
 <body>
-<h1>VAD split prototype</h1>
-<p class="muted">Upload an ATC recording &rarr; it is cut into transmissions.
-Click &#9654; on a row to hear exactly what the VAD cut. Tune the constants at
-the top of <code>vad_server.py</code> if cuts merge or split transmissions.</p>
+<h1>VAD split + transcription prototype</h1>
+<p class="muted">Upload an ATC recording &rarr; it is cut into transmissions and
+each one is transcribed in the background. Click &#9654; on a row to check the
+transcript against what you hear. Tune the VAD constants / <code>WHISPER_MODEL</code>
+in <code>vad_server.py</code> if cuts or text are off.</p>
 
 <div id="controls">
   <input type="file" id="file" accept=".mp3,audio/*">
@@ -162,7 +285,7 @@ the top of <code>vad_server.py</code> if cuts merge or split transmissions.</p>
 <audio id="player" controls></audio>
 <div id="status" class="muted"></div>
 <table id="tbl" hidden>
-  <thead><tr><th></th><th>#</th><th>start &rarr; end</th><th>duration</th></tr></thead>
+  <thead><tr><th></th><th>#</th><th>start &rarr; end</th><th>duration</th><th>transcript</th></tr></thead>
   <tbody id="rows"></tbody>
 </table>
 
@@ -221,9 +344,45 @@ player.addEventListener('seeking', () => {
   }
 });
 
+let baseStatus = '';
+let uploadGen = 0;  // bumped per upload so a stale poll loop stops itself
+
+function fillTranscripts(segs) {
+  segs.forEach((seg, i) => {
+    const td = rows.children[i]?.querySelector('.txt');
+    if (!td || seg.transcript === null || !td.classList.contains('pending')) return;
+    td.textContent = seg.transcript || '(unintelligible)';
+    td.classList.remove('pending');
+    segments[i] = seg;
+  });
+}
+
+async function pollJob(jobId, gen) {
+  while (gen === uploadGen) {
+    await new Promise(r => setTimeout(r, 1000));
+    let job;
+    try {
+      const res = await fetch('/audio-job/' + jobId);
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      job = await res.json();
+    } catch (err) {
+      setStatus('lost transcription job: ' + err.message, true);
+      return;
+    }
+    if (gen !== uploadGen) return;
+    fillTranscripts(job.segments);
+    if (job.status === 'done') { setStatus(baseStatus); return; }
+    if (job.status === 'error') { setStatus('transcription failed: ' + job.error, true); return; }
+    setStatus(baseStatus + (job.status === 'loading_model'
+      ? ' \\u2014 loading whisper model\\u2026'
+      : ' \\u2014 transcribing ' + job.progress.done + '/' + job.progress.total + '\\u2026'));
+  }
+}
+
 document.getElementById('file').addEventListener('change', async (e) => {
   const f = e.target.files[0];
   if (!f) return;
+  const gen = ++uploadGen;
   player.src = URL.createObjectURL(f);
   tbl.hidden = true;
   rows.innerHTML = '';
@@ -235,20 +394,23 @@ document.getElementById('file').addEventListener('change', async (e) => {
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || res.statusText);
     segments = data.segments;
-    setStatus(segments.length + ' transmissions in ' + fmt(data.duration_s)
+    baseStatus = segments.length + ' transmissions in ' + fmt(data.duration_s)
       + '  (threshold ' + data.tunables.vad_threshold
       + ', min silence ' + data.tunables.min_silence_s + 's'
-      + ', min speech ' + data.tunables.min_speech_s + 's)');
+      + ', min speech ' + data.tunables.min_speech_s + 's)';
+    setStatus(baseStatus);
     for (const [i, seg] of segments.entries()) {
       const tr = document.createElement('tr');
       tr.innerHTML = '<td><button class="play">\\u25B6</button></td>'
         + '<td class="num">' + seg.segment + '</td>'
         + '<td class="num">' + fmt(seg.start_s) + ' \\u2192 ' + fmt(seg.end_s) + '</td>'
-        + '<td class="num">' + seg.duration_s.toFixed(2) + 's</td>';
+        + '<td class="num">' + seg.duration_s.toFixed(2) + 's</td>'
+        + '<td class="txt pending">\\u2026</td>';
       tr.querySelector('button').addEventListener('click', () => playSegment(i));
       rows.appendChild(tr);
     }
     tbl.hidden = false;
+    pollJob(data.job_id, gen);
   } catch (err) {
     setStatus('upload failed: ' + err.message, true);
   }
