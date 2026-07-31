@@ -166,7 +166,7 @@ audio_proto/
 |---|---|---|
 | 1 | VAD split + per-row playback | ✅ done |
 | 2 | Per-row transcription (faster-whisper) | ✅ done, GPU-accelerated |
-| 3 | Per-row speaker ID (ATC vs. PILOT) | not started |
+| 3 | Per-row speaker ID (ATC vs. PILOT) | ✅ done |
 | 4 | Integrate into the main app (`backend/`, `src/App.jsx`) | not started |
 | 5 | Hardening & polish | not started |
 
@@ -187,7 +187,8 @@ lazily on the first upload, not at startup.
 
 If an NVIDIA GPU is present, Whisper runs on it automatically (`float16`);
 otherwise it falls back to CPU (`int8`). The server prints which one it picked,
-e.g. `whisper: small.en on cuda (float16)`.
+e.g. `whisper: small.en on cuda (float16)`. Speaker ID (resemblyzer) stays on
+CPU regardless — it's a tiny model, GPU wouldn't meaningfully speed it up.
 
 ### Using it
 
@@ -196,13 +197,18 @@ e.g. `whisper: small.en on cuda (float16)`.
 2. Each detected transmission appears as a row: `#`, `start → end`, duration,
    and a **▶ play** button that seeks the hidden `<audio>` element to the
    segment's start and pauses at its end.
-3. Transcripts pop in per row a few seconds later as a background job works
-   through the segments (status line shows `transcribing N/M…`).
+3. Transcripts and an ATC/PILOT chip (with the raw similarity score) pop in
+   per row a few seconds later as a background job works through the segments
+   (status line shows `transcribing N/M…`).
+4. Drag the **ATC threshold** slider to recalibrate every chip instantly —
+   it relabels from the similarity scores already fetched, no re-upload needed.
 
 **What to check:**
 - **Segmentation** — does each row contain exactly one transmission? Watch for
   two transmissions merged into one row, or one transmission split across two.
 - **Transcription** — does the text match what you hear when you click ▶?
+- **Speaker ID** — do the ATC/PILOT chips match your ear? Find the slider
+  position that separates the classes best for this recording.
 
 ### Testing without the browser
 
@@ -221,9 +227,13 @@ curl -s http://localhost:8100/audio-job/<job_id> | python3 -m json.tool
 | `MIN_SPEECH_S` | constant, top of `vad_server.py` | `0.3` | speech regions shorter than this are dropped (squelch clicks) |
 | `SPEECH_PAD_S` | constant, top of `vad_server.py` | `0.1` | padding added to each side of a detected region |
 | `WHISPER_MODEL` | env var | `small.en` | faster-whisper model size, e.g. `WHISPER_MODEL=medium.en uv run audio_proto/vad_server.py` if accuracy disappoints |
+| `ATC_SIM_THRESHOLD` | constant, top of `vad_server.py` | `0.75` | default cosine-similarity cut for the ATC/PILOT label — the in-page slider overrides this live, per recording |
+| `ATC_FINGERPRINT_PATH` | env var | repo-root `atc_fingerprint.npy` | path to the reference ATC voice fingerprint used for speaker ID |
 
 If transmissions merge or split incorrectly, tune the VAD constants and
-restart. If transcripts are inaccurate, try a larger `WHISPER_MODEL`.
+restart. If transcripts are inaccurate, try a larger `WHISPER_MODEL`. If
+speaker labels are off, use the slider first — restarting with a new
+`ATC_SIM_THRESHOLD` is usually unnecessary.
 
 ---
 
