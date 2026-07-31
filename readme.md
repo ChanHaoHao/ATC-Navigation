@@ -145,6 +145,88 @@ It can also deal with multiple aircrafts.
 
 ---
 
+## Audio Transcription Pipeline (Prototype)
+
+A standalone prototype — separate from the React frontend and `backend/server.py`
+— that takes an uploaded ATC recording and splits it into individual
+transmissions, transcribes each one, and (eventually) drives the map the same
+way manually-typed commands do today. It's built and checked out one pipeline
+stage at a time before anything is wired into the main app; see
+[`docs/audio-pipeline-plan.md`](docs/audio-pipeline-plan.md) for the full design
+and step-by-step plan.
+
+```
+audio_proto/
+└── vad_server.py     # one FastAPI script: serves the test page + all endpoints
+```
+
+**Status**
+
+| Step | Description | State |
+|---|---|---|
+| 1 | VAD split + per-row playback | ✅ done |
+| 2 | Per-row transcription (faster-whisper) | ✅ done, GPU-accelerated |
+| 3 | Per-row speaker ID (ATC vs. PILOT) | not started |
+| 4 | Integrate into the main app (`backend/`, `src/App.jsx`) | not started |
+| 5 | Hardening & polish | not started |
+
+### Running it
+
+The script is self-contained — dependencies are declared inline (PEP 723) and
+installed automatically by [`uv`](https://docs.astral.sh/uv/), no venv or
+`pip install` needed:
+
+```bash
+uv run audio_proto/vad_server.py
+```
+
+Then open `http://localhost:8100`. First run downloads torch, faster-whisper,
+and (if an NVIDIA GPU is detected) the CUDA cuBLAS/cuDNN wheels — a couple of
+minutes. The Whisper model itself (`small.en` by default, ~500 MB) downloads
+lazily on the first upload, not at startup.
+
+If an NVIDIA GPU is present, Whisper runs on it automatically (`float16`);
+otherwise it falls back to CPU (`int8`). The server prints which one it picked,
+e.g. `whisper: small.en on cuda (float16)`.
+
+### Using it
+
+1. Upload an `.mp3` (real recordings live in [`audio/`](audio/), e.g.
+   `left_channel.mp3`, `delta795_exit_runway.mp3`).
+2. Each detected transmission appears as a row: `#`, `start → end`, duration,
+   and a **▶ play** button that seeks the hidden `<audio>` element to the
+   segment's start and pauses at its end.
+3. Transcripts pop in per row a few seconds later as a background job works
+   through the segments (status line shows `transcribing N/M…`).
+
+**What to check:**
+- **Segmentation** — does each row contain exactly one transmission? Watch for
+  two transmissions merged into one row, or one transmission split across two.
+- **Transcription** — does the text match what you hear when you click ▶?
+
+### Testing without the browser
+
+```bash
+curl -s -F "file=@audio/delta795_exit_runway.mp3" http://localhost:8100/upload-audio | python3 -m json.tool
+# grab job_id from the response, then poll:
+curl -s http://localhost:8100/audio-job/<job_id> | python3 -m json.tool
+```
+
+### Tunables
+
+| Name | Where | Default | Purpose |
+|---|---|---|---|
+| `VAD_THRESHOLD` | constant, top of `vad_server.py` | `0.5` | speech-probability threshold |
+| `MIN_SILENCE_S` | constant, top of `vad_server.py` | `0.1` | silence gap below which adjacent speech regions are merged |
+| `MIN_SPEECH_S` | constant, top of `vad_server.py` | `0.3` | speech regions shorter than this are dropped (squelch clicks) |
+| `SPEECH_PAD_S` | constant, top of `vad_server.py` | `0.1` | padding added to each side of a detected region |
+| `WHISPER_MODEL` | env var | `small.en` | faster-whisper model size, e.g. `WHISPER_MODEL=medium.en uv run audio_proto/vad_server.py` if accuracy disappoints |
+
+If transmissions merge or split incorrectly, tune the VAD constants and
+restart. If transcripts are inaccurate, try a larger `WHISPER_MODEL`.
+
+---
+
 ## Future Works
 
 - ~~Maybe deal with left turn and right turn for the last taxiway, so that it does not need to light the full taxiway up~~ [Solved on Apr 17]

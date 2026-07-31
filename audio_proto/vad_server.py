@@ -11,6 +11,10 @@
 #     "numpy>=1.24.0",
 #     "nvidia-cublas-cu12",
 #     "nvidia-cudnn-cu12>=9,<10",
+#     "resemblyzer>=0.1.4",
+#     "setuptools<81",
+#     "torch",
+#     "torchaudio",
 # ]
 #
 # [[tool.uv.index]]
@@ -22,9 +26,10 @@
 # torch = { index = "pytorch-cpu" }
 # torchaudio = { index = "pytorch-cpu" }
 # ///
-"""Audio prototype, steps 1+2: upload an mp3, VAD-split it into transmissions,
-listen to each cut, and watch per-row transcripts fill in as faster-whisper
-works through the segments in the background. Run with:
+"""Audio prototype, steps 1-3: upload an mp3, VAD-split it into transmissions,
+listen to each cut, and watch per-row transcripts + ATC/PILOT speaker labels
+fill in as faster-whisper and resemblyzer work through the segments in the
+background. Run with:
 
     uv run audio_proto/vad_server.py
 
@@ -47,6 +52,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse
 from faster_whisper import WhisperModel
+from resemblyzer import VoiceEncoder
 from silero_vad import get_speech_timestamps, load_silero_vad
 
 # ---- VAD tunables -----------------------------------------------------------
@@ -65,17 +71,31 @@ AVIATION_PROMPT = (
     "taxi via Alpha, Bravo, Charlie, Echo, Foxtrot, Golf, Hotel, India, Juliet, "
     "Kilo, Lima, Mike, November, Oscar, Papa, Quebec, Romeo, Sierra, Tango, "
     "Uniform, Victor, Whiskey, X-ray, Yankee, Zulu, hold short of, cleared to land, "
-    "cleared for takeoff, contact ground point niner, readback correct."
+    "cleared for takeoff, contact ground point niner, readback correct, "
+    "wind one zero zero at two zero, gust two eight."
 )
+
+# ---- Speaker-ID tunables -----------------------------------------------------
+# similarity >= this -> "ATC", else "PILOT". Start ~0.9 per the design doc, but
+# calibrate with the checkpoint slider in the page — short/noisy segments pull
+# the true-ATC similarity down, so the right cut varies per recording.
+ATC_SIM_THRESHOLD = 0.75
+ATC_FINGERPRINT_PATH = os.environ.get(
+    "ATC_FINGERPRINT_PATH", str(Path(__file__).resolve().parent.parent / "atc_fingerprint.npy")
+)
+# -----------------------------------------------------------------------------
 
 TARGET_SR = 16000
 PORT = 8100
 
-app = FastAPI(title="ATC audio prototype — steps 1+2: VAD split + transcription")
+app = FastAPI(title="ATC audio prototype — steps 1-3: VAD split + transcription + speaker ID")
 
 _vad_model = None
 _whisper_model = None
 _whisper_lock = threading.Lock()
+_speaker_encoder = None
+_speaker_lock = threading.Lock()
+_atc_fingerprint = None
 
 # job_id -> {status, done, total, error, segments}; in-memory only, fine for a prototype
 JOBS: dict[str, dict] = {}
@@ -161,15 +181,37 @@ def get_whisper() -> WhisperModel:
         return _whisper_model
 
 
+def get_speaker_encoder() -> VoiceEncoder:
+    global _speaker_encoder
+    with _speaker_lock:
+        if _speaker_encoder is None:
+            _speaker_encoder = VoiceEncoder()
+        return _speaker_encoder
+
+
+def get_atc_fingerprint() -> np.ndarray:
+    global _atc_fingerprint
+    if _atc_fingerprint is None:
+        path = Path(ATC_FINGERPRINT_PATH)
+        if not path.exists():
+            raise FileNotFoundError(f"ATC fingerprint not found at {path}")
+        _atc_fingerprint = np.load(path)
+    return _atc_fingerprint
+
+
 def transcribe_job(job_id: str, audio: np.ndarray) -> None:
-    """Worker thread: fill in transcript + words for each segment of a job."""
+    """Worker thread: fill in transcript, words, and ATC/PILOT speaker ID for
+    each segment of a job."""
     job = JOBS[job_id]
     try:
-        model = get_whisper()  # may download the model on first run
+        whisper = get_whisper()  # may download the model on first run
+        encoder = get_speaker_encoder()
+        fingerprint = get_atc_fingerprint()
         job["status"] = "transcribing"
         for seg in job["segments"]:
             chunk = audio[int(seg["start_s"] * TARGET_SR):int(seg["end_s"] * TARGET_SR)]
-            pieces, _ = model.transcribe(
+
+            pieces, _ = whisper.transcribe(
                 chunk,
                 language="en",
                 beam_size=5,
@@ -184,6 +226,12 @@ def transcribe_job(job_id: str, audio: np.ndarray) -> None:
                     words.append({"w": w.word.strip(), "t": round(float(seg["start_s"] + w.start), 2)})
             seg["transcript"] = " ".join(t for t in texts if t)
             seg["words"] = words
+
+            embedding = encoder.embed_utterance(chunk)
+            similarity = round(float(np.dot(embedding, fingerprint)), 3)
+            seg["similarity"] = similarity
+            seg["speaker"] = "ATC" if similarity >= ATC_SIM_THRESHOLD else "PILOT"
+
             job["done"] += 1
         job["status"] = "done"
     except Exception as e:
@@ -208,6 +256,8 @@ async def upload_audio(file: UploadFile):
     for seg in segments:
         seg["transcript"] = None  # filled in by the job as it progresses
         seg["words"] = None
+        seg["speaker"] = None
+        seg["similarity"] = None
 
     job_id = uuid.uuid4().hex[:12]
     JOBS[job_id] = {
@@ -227,6 +277,7 @@ async def upload_audio(file: UploadFile):
             "min_silence_s": MIN_SILENCE_S,
             "min_speech_s": MIN_SPEECH_S,
             "speech_pad_s": SPEECH_PAD_S,
+            "atc_sim_threshold": ATC_SIM_THRESHOLD,
         },
         "segments": segments,
     }
@@ -249,7 +300,7 @@ PAGE = """<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
-<title>ATC audio — VAD + transcription prototype</title>
+<title>ATC audio — VAD + transcription + speaker ID prototype</title>
 <style>
   :root { color-scheme: dark; }
   body { font-family: system-ui, sans-serif; background: #101418; color: #dde3ea;
@@ -262,8 +313,14 @@ PAGE = """<!doctype html>
   th, td { padding: 0.45rem 0.7rem; text-align: left; border-bottom: 1px solid #232a32; }
   th { color: #8b95a1; font-weight: 500; font-size: 0.8rem; text-transform: uppercase; }
   td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
-  td.txt { width: 55%; }
+  td.txt { width: 50%; }
   td.txt.pending { color: #566270; }
+  td.spk { white-space: nowrap; }
+  td.spk.pending { color: #566270; }
+  .chip { padding: 2px 8px; border-radius: 10px; font-size: 0.75rem; font-weight: 600; }
+  .chip.atc { background: #123354; color: #7ab8ff; }
+  .chip.pilot { background: #4a2c12; color: #ffb37a; }
+  .chip .sim { opacity: 0.65; font-weight: 400; }
   tr.playing { background: #1a2833; }
   button.play { background: #1f6feb; color: white; border: 0; border-radius: 5px;
                 padding: 0.3rem 0.8rem; cursor: pointer; font-size: 0.9rem; }
@@ -273,19 +330,25 @@ PAGE = """<!doctype html>
 </style>
 </head>
 <body>
-<h1>VAD split + transcription prototype</h1>
-<p class="muted">Upload an ATC recording &rarr; it is cut into transmissions and
-each one is transcribed in the background. Click &#9654; on a row to check the
-transcript against what you hear. Tune the VAD constants / <code>WHISPER_MODEL</code>
-in <code>vad_server.py</code> if cuts or text are off.</p>
+<h1>VAD split + transcription + speaker ID prototype</h1>
+<p class="muted">Upload an ATC recording &rarr; it is cut into transmissions,
+transcribed, and each row gets an ATC/PILOT chip from cosine similarity
+against <code>atc_fingerprint.npy</code>. Click &#9654; to check a row against
+what you hear; drag the threshold slider until the chips match your ear &mdash;
+it relabels instantly from the similarity scores already fetched, no
+re-upload needed.</p>
 
 <div id="controls">
   <input type="file" id="file" accept=".mp3,audio/*">
+  <label class="muted" style="margin-left: auto; display: flex; align-items: center; gap: 0.5rem;">
+    ATC threshold: <span id="threshVal">0.75</span>
+    <input type="range" id="thresh" min="0" max="1" step="0.01" value="0.75">
+  </label>
 </div>
 <audio id="player" controls></audio>
 <div id="status" class="muted"></div>
 <table id="tbl" hidden>
-  <thead><tr><th></th><th>#</th><th>start &rarr; end</th><th>duration</th><th>transcript</th></tr></thead>
+  <thead><tr><th></th><th>#</th><th>start &rarr; end</th><th>duration</th><th>speaker</th><th>transcript</th></tr></thead>
   <tbody id="rows"></tbody>
 </table>
 
@@ -294,10 +357,28 @@ const player = document.getElementById('player');
 const status = document.getElementById('status');
 const tbl = document.getElementById('tbl');
 const rows = document.getElementById('rows');
+const threshSlider = document.getElementById('thresh');
+const threshVal = document.getElementById('threshVal');
 
 let segments = [];
 let stopAt = null;      // pause when playback passes this time
 let playingRow = null;  // index into segments, or null
+
+function renderChip(td, seg) {
+  if (seg.similarity === null || seg.similarity === undefined) return;
+  const label = seg.similarity >= parseFloat(threshSlider.value) ? 'ATC' : 'PILOT';
+  td.className = 'spk';
+  td.innerHTML = '<span class="chip ' + label.toLowerCase() + '">' + label
+    + ' <span class="sim">' + seg.similarity.toFixed(2) + '</span></span>';
+}
+
+threshSlider.addEventListener('input', () => {
+  threshVal.textContent = threshSlider.value;
+  segments.forEach((seg, i) => {
+    const td = rows.children[i]?.querySelector('.spk');
+    if (td) renderChip(td, seg);
+  });
+});
 
 function fmt(t) {
   const m = Math.floor(t / 60), s = (t % 60).toFixed(2).padStart(5, '0');
@@ -349,11 +430,13 @@ let uploadGen = 0;  // bumped per upload so a stale poll loop stops itself
 
 function fillTranscripts(segs) {
   segs.forEach((seg, i) => {
-    const td = rows.children[i]?.querySelector('.txt');
-    if (!td || seg.transcript === null || !td.classList.contains('pending')) return;
-    td.textContent = seg.transcript || '(unintelligible)';
-    td.classList.remove('pending');
+    const txtTd = rows.children[i]?.querySelector('.txt');
+    if (!txtTd || seg.transcript === null || !txtTd.classList.contains('pending')) return;
+    txtTd.textContent = seg.transcript || '(unintelligible)';
+    txtTd.classList.remove('pending');
     segments[i] = seg;
+    const spkTd = rows.children[i]?.querySelector('.spk');
+    if (spkTd) renderChip(spkTd, seg);
   });
 }
 
@@ -399,12 +482,15 @@ document.getElementById('file').addEventListener('change', async (e) => {
       + ', min silence ' + data.tunables.min_silence_s + 's'
       + ', min speech ' + data.tunables.min_speech_s + 's)';
     setStatus(baseStatus);
+    threshSlider.value = data.tunables.atc_sim_threshold;
+    threshVal.textContent = data.tunables.atc_sim_threshold;
     for (const [i, seg] of segments.entries()) {
       const tr = document.createElement('tr');
       tr.innerHTML = '<td><button class="play">\\u25B6</button></td>'
         + '<td class="num">' + seg.segment + '</td>'
         + '<td class="num">' + fmt(seg.start_s) + ' \\u2192 ' + fmt(seg.end_s) + '</td>'
         + '<td class="num">' + seg.duration_s.toFixed(2) + 's</td>'
+        + '<td class="spk pending">\\u2026</td>'
         + '<td class="txt pending">\\u2026</td>';
       tr.querySelector('button').addEventListener('click', () => playSegment(i));
       rows.appendChild(tr);
