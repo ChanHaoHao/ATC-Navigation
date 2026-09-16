@@ -5,3 +5,16 @@ numpy>=1.24.0
 huggingface_hub>=0.20.0
 python-multipart>=0.0.6
 osmnx
+
+# audio transcription pipeline (backend/audio.py, asr.py, speaker.py) — also
+# requires ffmpeg on PATH
+silero-vad>=5.1
+faster-whisper>=1.0
+soundfile>=0.12
+soxr>=0.3
+resemblyzer>=0.1.4
+setuptools<81
+torch
+torchaudio
+nvidia-cublas-cu12; sys_platform == "linux"
+nvidia-cudnn-cu12>=9,<10; sys_platform == "linux"

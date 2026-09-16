@@ -25,3 +25,7 @@ airport_data = {
 # ── Per-callsign aircraft state ───────────────────────────────────────────────
 # e.g. aircraft_state["DAL795"] = {"runway": "13L", "prev_routes": [["ZA","F","A"]]}
 aircraft_state: dict[str, dict] = {}
+
+# ── Audio transcription jobs (populated by audio.upload_audio) ────────────────
+# job_id -> {status, done, total, error, segments}
+audio_jobs: dict[str, dict] = {}

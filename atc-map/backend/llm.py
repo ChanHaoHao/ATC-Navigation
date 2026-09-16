@@ -195,3 +195,34 @@ Respond with ONLY a JSON object, no markdown, no explanation:
             "confirmed": "true" in raw.lower(),
             "reason": raw[:120],
         }
+
+
+def classify_speaker(transcript: str) -> str:
+    """
+    Text-only ATC/PILOT classifier, used as a tiebreak when a segment's voice
+    similarity to the ATC fingerprint lands in the ambiguity band. ATC issues
+    instructions/clearances; pilots read back ending with their callsign.
+
+    Returns "ATC" or "PILOT".
+    """
+    client = _client()
+
+    prompt = f"""Classify who is speaking in this air traffic control radio transmission.
+
+Transmission:
+"{transcript}"
+
+Rules:
+- ATC (controller) issues instructions, clearances, headings, or information
+- PILOT reads back instructions, typically ending with their callsign
+
+Respond with ONLY one word: ATC or PILOT"""
+
+    response = client.chat_completion(
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=5,
+        temperature=0.1,
+    )
+
+    raw = response.choices[0].message.content.strip().upper()
+    return "ATC" if "ATC" in raw else "PILOT"

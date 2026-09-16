@@ -83,6 +83,12 @@ function formatTime(ts) {
   });
 }
 
+function fmtClock(t) {
+  if (!isFinite(t) || t < 0) return "0:00";
+  const m = Math.floor(t / 60), s = Math.floor(t % 60);
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 //  SVG PATH BUILDER
 // ══════════════════════════════════════════════════════════════════════════════
@@ -272,9 +278,23 @@ function MapView({ data, filename }) {
   const [rightTab, setRightTab] = useState("log");
 
   const [debugMode, setDebugMode] = useState(false);
-  const [csvRows, setCsvRows] = useState([]);        // parsed CSV rows
+  const [csvRows, setCsvRows] = useState([]);        // parsed CSV rows (from CSV file or mp3 upload)
   const [csvPlayIdx, setCsvPlayIdx] = useState(-1);  // which row is "current" for playback
   const csvFileRef = useRef(null);
+
+  // ── MP3 upload + playback (Step 4: audio pipeline integration) ─────────
+  const [csvSource, setCsvSource] = useState(null);       // null | "csv" | "mp3" — which loader filled csvRows
+  const [audioSrc, setAudioSrc] = useState(null);          // object URL of the uploaded mp3
+  const [audioJobStatus, setAudioJobStatus] = useState(null); // { status, done, total, error }
+  const [autoMode, setAutoMode] = useState(true);          // AUTO: reveal drives SEND automatically
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const mp3FileRef = useRef(null);
+  const audioElRef = useRef(null);
+  const rowRefs = useRef({});           // segment -> row DOM node, for auto-scroll
+  const sentSegmentsRef = useRef(new Set()); // segments already auto-sent this playback
+  const audioGenRef = useRef(0);        // bumped per upload so a stale poll loop stops itself
 
   // Resizable right panel
   const [rightPanelWidth, setRightPanelWidth] = useState(280);
@@ -475,6 +495,7 @@ function MapView({ data, filename }) {
     reader.onload = (e) => {
       const rows = parseCsv(e.target.result);
       setCsvRows(rows);
+      setCsvSource("csv");
       setCsvPlayIdx(-1);
       setReadbackResults({});
       setRightTab("transcript");
@@ -585,6 +606,161 @@ function MapView({ data, filename }) {
       setPilotSending(prev => ({ ...prev, [row.segment]: false }));
     }
   };
+
+  // ── MP3 upload + playback ──────────────────────────────────────────────
+  // Prototype (audio_proto/vad_server.py) emits "PILOT"; csvRows/sendPilotRow
+  // expect "Pilot" — normalize once here so downstream code has one shape.
+  const normalizeSpeaker = (s) => (s === "PILOT" ? "Pilot" : s);
+
+  const pollAudioJob = async (jobId, gen) => {
+    while (gen === audioGenRef.current) {
+      await new Promise((r) => setTimeout(r, 1000));
+      if (gen !== audioGenRef.current) return;
+      let job;
+      try {
+        const res = await fetch(`${BACKEND_URL}/audio-job/${jobId}`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        job = await res.json();
+      } catch (err) {
+        setAudioJobStatus({ status: "error", error: err.message });
+        return;
+      }
+      if (gen !== audioGenRef.current) return;
+      setCsvRows((prev) => prev.map((row, i) => {
+        const seg = job.segments[i];
+        if (!seg || seg.transcript === null || row.transcript !== null) return row;
+        return {
+          ...row,
+          transcript: seg.transcript,
+          words: seg.words,
+          speaker: normalizeSpeaker(seg.speaker),
+          similarity: seg.similarity,
+        };
+      }));
+      setAudioJobStatus({
+        status: job.status, done: job.progress.done, total: job.progress.total, error: job.error,
+      });
+      if (job.status === "done" || job.status === "error") return;
+    }
+  };
+
+  const uploadMp3 = async (file) => {
+    if (!file) return;
+    const gen = ++audioGenRef.current;
+    sentSegmentsRef.current = new Set();
+    setReadbackResults({});
+    setLastAtcByCallsign({});
+    setCsvPlayIdx(-1);
+    setCurrentTime(0);
+    setDuration(0);
+    setAudioSrc(URL.createObjectURL(file));
+    setCsvSource("mp3");
+    setCsvRows([]);
+    setAudioJobStatus({ status: "uploading" });
+    setRightTab("transcript");
+
+    const form = new FormData();
+    form.append("file", file);
+    try {
+      const res = await fetch(`${BACKEND_URL}/upload-audio`, { method: "POST", body: form });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || res.statusText);
+      if (gen !== audioGenRef.current) return;
+      setCsvRows(data.segments.map((s) => ({
+        segment: s.segment,
+        start_s: s.start_s,
+        end_s: s.end_s,
+        speaker: normalizeSpeaker(s.speaker),
+        similarity: s.similarity,
+        transcript: s.transcript,
+        words: s.words,
+      })));
+      setAudioJobStatus({ status: "loading_model", done: 0, total: data.segments.length });
+      pollAudioJob(data.job_id, gen);
+    } catch (err) {
+      setAudioJobStatus({ status: "error", error: err.message });
+    }
+  };
+
+  const togglePlay = () => {
+    const el = audioElRef.current;
+    if (!el) return;
+    if (el.paused) el.play(); else el.pause();
+  };
+
+  const onSeek = (e) => {
+    const t = parseFloat(e.target.value);
+    if (audioElRef.current) audioElRef.current.currentTime = t;
+    setCurrentTime(t);
+  };
+
+  const resetPlayback = async () => {
+    if (audioElRef.current) { audioElRef.current.pause(); audioElRef.current.currentTime = 0; }
+    sentSegmentsRef.current = new Set();
+    setCurrentTime(0);
+    setCsvPlayIdx(-1);
+    setReadbackResults({});
+    setLastAtcByCallsign({});
+    const callsigns = Object.keys(segmentsByCallsign);
+    setSegmentsByCallsign({});
+    setAircraftStates({});
+    setActiveCallsign(null);
+    setPinnedCallsign(null);
+    await Promise.all(callsigns.map((cs) =>
+      fetch(`${BACKEND_URL}/aircraft-state/${cs}`, { method: "DELETE" }).catch(() => {})
+    ));
+  };
+
+  // Wire the hidden <audio> element's events into state
+  useEffect(() => {
+    const el = audioElRef.current;
+    if (!el) return;
+    const onTime = () => setCurrentTime(el.currentTime);
+    const onLoaded = () => setDuration(el.duration || 0);
+    const onPlay = () => setIsPlaying(true);
+    const onPause = () => setIsPlaying(false);
+    el.addEventListener("timeupdate", onTime);
+    el.addEventListener("loadedmetadata", onLoaded);
+    el.addEventListener("play", onPlay);
+    el.addEventListener("pause", onPause);
+    return () => {
+      el.removeEventListener("timeupdate", onTime);
+      el.removeEventListener("loadedmetadata", onLoaded);
+      el.removeEventListener("play", onPlay);
+      el.removeEventListener("pause", onPause);
+    };
+  }, [audioSrc]);
+
+  // Timed reveal + auto-drive: purely derived from currentTime, so seeking
+  // backward re-hides rows with no extra state machine. sentSegmentsRef
+  // guards against re-sending a row the playhead has already passed once.
+  useEffect(() => {
+    if (csvSource !== "mp3" || csvRows.length === 0) return;
+
+    let current = -1;
+    for (const row of csvRows) {
+      if (row.start_s <= currentTime) current = row.segment; else break;
+    }
+    if (current !== -1 && current !== csvPlayIdx) setCsvPlayIdx(current);
+
+    if (!autoMode) return;
+    for (const row of csvRows) {
+      if (row.start_s > currentTime) break;
+      if (sentSegmentsRef.current.has(row.segment)) continue;
+      if (!row.transcript || !row.speaker) continue; // not transcribed yet — wait for the poll
+      sentSegmentsRef.current.add(row.segment);
+      if (row.speaker === "ATC") sendCsvRow(row);
+      else if (row.speaker === "Pilot") sendPilotRow(row);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentTime, csvRows, autoMode, csvSource]);
+
+  // Auto-scroll the SCRIPT tab to follow playback
+  useEffect(() => {
+    if (csvSource === "mp3" && csvPlayIdx !== -1) {
+      rowRefs.current[csvPlayIdx]?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    }
+  }, [csvPlayIdx, csvSource]);
 
   // ── Parse ATC command ──────────────────────────────────────────────────
   const parseAtcCommand = async () => {
@@ -1718,34 +1894,116 @@ function MapView({ data, filename }) {
           {rightTab === "transcript" && (
             <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
               {/* Controls bar */}
-              {csvRows.length > 0 && (
-                <div style={{
-                  padding: "5px 10px", borderBottom: "1px solid #111e16",
-                  display: "flex", justifyContent: "flex-end", flexShrink: 0,
-                }}>
+              <div style={{
+                padding: "6px 10px", borderBottom: "1px solid #111e16",
+                display: "flex", flexDirection: "column", gap: 6, flexShrink: 0,
+              }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <input
+                    ref={mp3FileRef}
+                    type="file"
+                    accept=".mp3,audio/*"
+                    style={{ display: "none" }}
+                    onChange={(e) => { if (e.target.files[0]) uploadMp3(e.target.files[0]); }}
+                  />
                   <button
-                    onClick={() => {
-                      setCsvRows([]); setCsvPlayIdx(-1);
-                      setReadbackResults({}); setLastAtcByCallsign({});
-                    }}
+                    onClick={() => mp3FileRef.current?.click()}
                     style={{
-                      padding: "3px 8px", background: "transparent",
-                      border: "1px solid #2a1818", borderRadius: "3px",
-                      color: "#663333", fontSize: "8px", cursor: "pointer", fontFamily: "inherit",
-                    }}>✕ Clear</button>
+                      flex: 1, display: "flex", alignItems: "center", gap: 6,
+                      padding: "5px 7px",
+                      background: csvSource === "mp3" ? "rgba(102,204,255,0.07)" : "transparent",
+                      border: `1px solid ${csvSource === "mp3" ? "#1a3a4a" : "#1a2e22"}`,
+                      borderRadius: "3px", cursor: "pointer", fontFamily: "inherit",
+                      fontSize: "9px", color: csvSource === "mp3" ? "#66ccff" : "#2d4a38",
+                      textAlign: "left",
+                    }}>
+                    <span style={{ fontSize: "11px" }}>⬆</span>
+                    {csvSource === "mp3" ? "Load different MP3" : "Load MP3 Recording"}
+                  </button>
+                  {csvRows.length > 0 && (
+                    <button
+                      onClick={() => {
+                        audioGenRef.current++; // stop any in-flight poll loop
+                        setCsvRows([]); setCsvPlayIdx(-1); setCsvSource(null);
+                        setReadbackResults({}); setLastAtcByCallsign({});
+                        setAudioSrc(null); setAudioJobStatus(null);
+                        setCurrentTime(0); setDuration(0);
+                      }}
+                      style={{
+                        padding: "3px 8px", background: "transparent",
+                        border: "1px solid #2a1818", borderRadius: "3px",
+                        color: "#663333", fontSize: "8px", cursor: "pointer", fontFamily: "inherit",
+                      }}>✕ Clear</button>
+                  )}
                 </div>
-              )}
+
+                {audioJobStatus && (
+                  <div style={{ fontSize: "7px", color: audioJobStatus.status === "error" ? "#e84545" : "#3d5a48" }}>
+                    {audioJobStatus.status === "error" ? `error: ${audioJobStatus.error}`
+                      : audioJobStatus.status === "done" ? `${audioJobStatus.total} transmissions transcribed`
+                      : audioJobStatus.status === "loading_model" ? "loading whisper model…"
+                      : audioJobStatus.status === "transcribing" ? `transcribing ${audioJobStatus.done}/${audioJobStatus.total}…`
+                      : "analyzing…"}
+                  </div>
+                )}
+
+                {audioSrc && (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <button onClick={togglePlay} style={{
+                        width: 22, height: 22, borderRadius: "50%", border: "1px solid #2d5a42",
+                        background: "#0e2a1a", color: "#5eba8a", cursor: "pointer", fontSize: "10px",
+                        display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0,
+                        fontFamily: "inherit",
+                      }}>{isPlaying ? "⏸" : "▶"}</button>
+                      <input
+                        type="range" min={0} max={duration || 0} step={0.01}
+                        value={Math.min(currentTime, duration || 0)}
+                        onChange={onSeek}
+                        style={{ flex: 1, accentColor: "#5eba8a" }}
+                      />
+                      <span style={{ fontSize: "7px", color: "#2d5a48", whiteSpace: "nowrap" }}>
+                        {fmtClock(currentTime)} / {fmtClock(duration)}
+                      </span>
+                    </div>
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                      <button
+                        onClick={() => setAutoMode((m) => !m)}
+                        title="AUTO fires SEND automatically as the playhead reaches each row; MANUAL leaves it to you"
+                        style={{
+                          padding: "2px 6px", background: "transparent",
+                          border: `1px solid ${autoMode ? "#2d5a42" : "#1a2e22"}`,
+                          borderRadius: "3px", cursor: "pointer", fontFamily: "inherit",
+                          fontSize: "7px", fontWeight: 700, letterSpacing: "0.5px",
+                          color: autoMode ? "#5eba8a" : "#2d4a38",
+                        }}>{autoMode ? "AUTO" : "MANUAL"}</button>
+                      <button
+                        onClick={resetPlayback}
+                        title="Rewind and clear tracked aircraft so this recording can replay cleanly"
+                        style={{
+                          padding: "2px 6px", background: "transparent", border: "1px solid #1a2e22",
+                          borderRadius: "3px", cursor: "pointer", fontFamily: "inherit",
+                          fontSize: "7px", color: "#2d4a38",
+                        }}>&#8634; Reset playback</button>
+                    </div>
+                  </div>
+                )}
+              </div>
               <div style={{ flex: 1, overflowY: "auto" }}>
                 {csvRows.length === 0 ? (
                   <div style={{
                     padding: "20px 12px", fontSize: "9px",
                     color: "#1e3a2a", textAlign: "center", lineHeight: 1.8,
                   }}>
-                    No transcript loaded.<br />Enable Debug Segments<br />then upload a CSV.
+                    No transcript loaded.<br />Load an MP3 recording above,<br />or enable Debug Segments to upload a CSV.
                   </div>
                 ) : csvRows.map((row) => {
-                  const isATC   = row.speaker === "ATC";
-                  const isPilot = row.speaker === "Pilot";
+                  // mp3 playback: rows the playhead hasn't reached yet stay collapsed
+                  // — purely derived from currentTime, so seeking backward re-hides them.
+                  const revealed = csvSource !== "mp3" || row.start_s <= currentTime;
+                  const pending  = revealed && !row.transcript; // reached, but ASR job isn't done yet
+                  const isATC   = revealed && row.speaker === "ATC";
+                  const isPilot = revealed && row.speaker === "Pilot";
                   const isCurrent = row.segment === csvPlayIdx;
 
                   // Pilot readback: keyed by pilot segment number
@@ -1755,71 +2013,85 @@ function MapView({ data, filename }) {
                   const isPilotSending = pilotSending[row.segment];
 
                   return (
-                    <div key={row.segment} style={{
-                      margin: "3px 8px", padding: "6px 8px", borderRadius: "4px",
-                      border: `1px solid ${isCurrent ? "#2d5a42" : "#0e1812"}`,
-                      background: isCurrent ? "rgba(94,186,138,0.05)" : "transparent",
-                      borderLeft: `3px solid ${isATC ? "#ff9f1c55" : isPilot ? "#5eba8a33" : "#111e16"}`,
-                    }}>
+                    <div key={row.segment}
+                      ref={(el) => { rowRefs.current[row.segment] = el; }}
+                      style={{
+                        margin: "3px 8px", padding: "6px 8px", borderRadius: "4px",
+                        border: `1px solid ${isCurrent ? "#2d5a42" : "#0e1812"}`,
+                        background: isCurrent ? "rgba(94,186,138,0.05)" : "transparent",
+                        borderLeft: `3px solid ${!revealed ? "#111e16" : isATC ? "#ff9f1c55" : isPilot ? "#5eba8a33" : "#111e16"}`,
+                        opacity: revealed ? 1 : 0.35,
+                        transition: "opacity 0.2s",
+                      }}>
                       {/* Header */}
                       <div style={{
                         display: "flex", justifyContent: "space-between",
                         alignItems: "center", marginBottom: 4,
                       }}>
                         <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                          <span style={{
-                            fontSize: "7px", fontWeight: 700,
-                            padding: "1px 4px", borderRadius: "2px",
-                            background: isATC ? "#241a06" : "#0a1e10",
-                            color: isATC ? "#ff9f1c" : "#5eba8a",
-                            border: `1px solid ${isATC ? "#3a2a10" : "#142e1c"}`,
-                          }}>{row.speaker}</span>
+                          {revealed && row.speaker && (
+                            <span style={{
+                              fontSize: "7px", fontWeight: 700,
+                              padding: "1px 4px", borderRadius: "2px",
+                              background: isATC ? "#241a06" : "#0a1e10",
+                              color: isATC ? "#ff9f1c" : "#5eba8a",
+                              border: `1px solid ${isATC ? "#3a2a10" : "#142e1c"}`,
+                            }}>{row.speaker}</span>
+                          )}
                           <span style={{ fontSize: "7px", color: "#1a3020" }}>
                             {Math.floor(row.start_s / 60)}:{String(Math.floor(row.start_s % 60)).padStart(2, "0")}
                           </span>
                         </div>
 
-                        <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
-                          {/* Confirmation checkbox — pilot rows only */}
-                          {isPilot && (
-                            <div title={rb?.reason || "Send this row to check readback"} style={{
-                              width: 14, height: 14, borderRadius: "3px",
-                              border: `1px solid ${confirmed ? "#5eba8a" : (rbLoading || isPilotSending) ? "#3d5a48" : "#1e3a2a"}`,
-                              background: confirmed ? "#0e2a1a" : "transparent",
-                              display: "flex", alignItems: "center", justifyContent: "center",
-                              fontSize: "9px", color: confirmed ? "#5eba8a" : "#1e3a2a",
-                              flexShrink: 0,
-                            }}>
-                              {(rbLoading || isPilotSending) ? "·" : confirmed ? "✓" : ""}
-                            </div>
-                          )}
+                        {revealed && row.transcript && (
+                          <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                            {/* Confirmation checkbox — pilot rows only */}
+                            {isPilot && (
+                              <div title={rb?.reason || "Send this row to check readback"} style={{
+                                width: 14, height: 14, borderRadius: "3px",
+                                border: `1px solid ${confirmed ? "#5eba8a" : (rbLoading || isPilotSending) ? "#3d5a48" : "#1e3a2a"}`,
+                                background: confirmed ? "#0e2a1a" : "transparent",
+                                display: "flex", alignItems: "center", justifyContent: "center",
+                                fontSize: "9px", color: confirmed ? "#5eba8a" : "#1e3a2a",
+                                flexShrink: 0,
+                              }}>
+                                {(rbLoading || isPilotSending) ? "·" : confirmed ? "✓" : ""}
+                              </div>
+                            )}
 
-                          {/* SEND button — both ATC and Pilot */}
-                          <button
-                            onClick={() => isATC ? sendCsvRow(row) : sendPilotRow(row)}
-                            disabled={
-                              (isATC && (atcLoading || backendStatus !== "connected")) ||
-                              (isPilot && (isPilotSending || backendStatus !== "connected"))
-                            }
-                            style={{
-                              padding: "2px 7px",
-                              background: isCurrent ? "#142e20" : "#0a1812",
-                              border: `1px solid ${isCurrent ? "#2d5a42" : "#1a2e22"}`,
-                              borderRadius: "2px",
-                              color: isCurrent ? "#5eba8a" : "#2d5a48",
-                              fontSize: "7px", fontWeight: 700,
-                              cursor: "pointer", fontFamily: "inherit",
-                              opacity: backendStatus !== "connected" ? 0.4 : 1,
-                            }}>
-                            {(isATC && isCurrent && atcLoading) || isPilotSending ? "..." : "SEND"}
-                          </button>
-                        </div>
+                            {/* SEND button — both ATC and Pilot */}
+                            <button
+                              onClick={() => isATC ? sendCsvRow(row) : sendPilotRow(row)}
+                              disabled={
+                                (isATC && (atcLoading || backendStatus !== "connected")) ||
+                                (isPilot && (isPilotSending || backendStatus !== "connected"))
+                              }
+                              style={{
+                                padding: "2px 7px",
+                                background: isCurrent ? "#142e20" : "#0a1812",
+                                border: `1px solid ${isCurrent ? "#2d5a42" : "#1a2e22"}`,
+                                borderRadius: "2px",
+                                color: isCurrent ? "#5eba8a" : "#2d5a48",
+                                fontSize: "7px", fontWeight: 700,
+                                cursor: "pointer", fontFamily: "inherit",
+                                opacity: backendStatus !== "connected" ? 0.4 : 1,
+                              }}>
+                              {(isATC && isCurrent && atcLoading) || isPilotSending ? "..." : "SEND"}
+                            </button>
+                          </div>
+                        )}
                       </div>
 
                       {/* Transcript text */}
-                      <div style={{ fontSize: "8px", lineHeight: 1.5, color: isATC ? "#8a7a5a" : "#4a7a5a" }}>
-                        {row.transcript}
-                      </div>
+                      {revealed && (
+                        <div style={{
+                          fontSize: "8px", lineHeight: 1.5,
+                          color: pending ? "#3d5a48" : isATC ? "#8a7a5a" : "#4a7a5a",
+                          fontStyle: pending ? "italic" : "normal",
+                        }}>
+                          {pending ? "transcribing…" : row.transcript}
+                        </div>
+                      )}
 
                       {/* LLM reason inline below pilot text */}
                       {isPilot && rb?.reason && !rbLoading && !isPilotSending && (
@@ -1838,6 +2110,11 @@ function MapView({ data, filename }) {
           )}
         </div>
       </div>
+
+      {/* Keep the media element outside the selected sidebar panel.  The
+          SCRIPT panel is conditionally rendered, so nesting it there causes
+          browsers to stop playback whenever the user changes tabs. */}
+      {audioSrc && <audio ref={audioElRef} src={audioSrc} style={{ display: "none" }} />}
 
       {/* ── ATC COMMAND PANEL (bottom) ─────────────────────────────────── */}
       <div style={{

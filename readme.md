@@ -167,7 +167,7 @@ audio_proto/
 | 1 | VAD split + per-row playback | ✅ done |
 | 2 | Per-row transcription (faster-whisper) | ✅ done, GPU-accelerated |
 | 3 | Per-row speaker ID (ATC vs. PILOT) | ✅ done |
-| 4 | Integrate into the main app (`backend/`, `src/App.jsx`) | not started |
+| 4 | Integrate into the main app (`backend/`, `src/App.jsx`) | ✅ done |
 | 5 | Hardening & polish | not started |
 
 ### Running it

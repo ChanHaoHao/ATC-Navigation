@@ -6,11 +6,14 @@ route resolver, visualization layer, and LLM parsing into the pipeline the
 frontend consumes.
 
 Module layout:
-    state.py          shared in-memory state (airport + aircraft)
+    state.py          shared in-memory state (airport + aircraft + audio jobs)
     geometry.py       GeoJSON loading, intersections, runway-entry index
     routing.py        route disambiguation + BFS bridging
     visualization.py  colored-segment computation for the map
-    llm.py            Llama 3 70B parsing + readback checking
+    llm.py            Llama 3 70B parsing, readback checking + speaker classification
+    audio.py          mp3 upload, decoding, VAD segmentation, job management
+    asr.py            faster-whisper transcription
+    speaker.py        ATC/PILOT voice fingerprint matching
     server.py         this file — HTTP API + app wiring
 
 Usage:
@@ -37,6 +40,7 @@ from geometry import load_geojson
 from routing import resolve_route, validate_route_partial
 from visualization import compute_colored_segments
 from llm import parse_atc_with_llm, parse_atc_raw, check_readback
+from audio import router as audio_router
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -51,6 +55,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(audio_router)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
