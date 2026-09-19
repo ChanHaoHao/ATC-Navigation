@@ -47,13 +47,35 @@ def get_atc_fingerprint() -> np.ndarray:
     return _atc_fingerprint
 
 
-def identify_speaker(chunk: np.ndarray, transcript: str = "") -> dict:
+def build_fingerprint(chunks: list[np.ndarray]) -> np.ndarray:
+    """Build one normalized voice fingerprint from known samples of a speaker."""
+    if not chunks:
+        raise ValueError("at least one reference sample is required")
+    encoder = get_speaker_encoder()
+    embeddings = [encoder.embed_utterance(chunk) for chunk in chunks if chunk.size]
+    if not embeddings:
+        raise ValueError("reference samples are empty")
+    fingerprint = np.mean(embeddings, axis=0)
+    norm = np.linalg.norm(fingerprint)
+    if norm == 0:
+        raise ValueError("could not build a speaker fingerprint")
+    return fingerprint / norm
+
+
+def identify_speaker(
+    chunk: np.ndarray,
+    transcript: str = "",
+    fingerprint: np.ndarray | None = None,
+) -> dict:
     """Embed one segment and classify it ATC/PILOT. When the similarity score
     lands in the ambiguity band around the threshold and a transcript is
     available, breaks the tie with LLM text classification instead of the
-    raw cutoff. Returns {speaker, similarity}."""
+    raw cutoff. ``fingerprint`` can provide a recording-specific ATC reference;
+    omitting it preserves the server's configured reference. Returns
+    {speaker, similarity}."""
     encoder = get_speaker_encoder()
-    fingerprint = get_atc_fingerprint()
+    if fingerprint is None:
+        fingerprint = get_atc_fingerprint()
     embedding = encoder.embed_utterance(chunk)
     similarity = round(float(np.dot(embedding, fingerprint)), 3)
 
